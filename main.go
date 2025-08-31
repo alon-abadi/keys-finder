@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -17,37 +22,54 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
+// ----- Config -----
 const repoURL = "https://github.com/alon-abadi/sample-keys-repo.git"
 const cloneDir = "./sample-keys-repo"
+const statePath = cloneDir + "/.scan_state.json"
+const scanDeletionsToo = true
+
+type State struct {
+	Processed map[string]bool `json:"processed"` // commit -> done?
+}
 
 type Job struct {
-	Commit *object.Commit
+	Index    int
+	Commit   *object.Commit
+	Branches []string
+	Chunks   []ChunkLines // pre-extracted changed lines (no repo access needed in workers)
+}
+
+type ChunkLines struct {
+	File   string
+	Change string   // "added" or "deleted"
+	Lines  []string // content lines in this chunk
 }
 
 type Hit struct {
-	File     string
-	Pattern  string
-	Line     string
-	Change   string // "added"/"deleted"
+	File    string
+	Pattern string
+	Line    string
+	Change  string // "added" or "deleted"
 }
 
-// Result = all matches for one commit
 type Result struct {
+	Index    int
 	Commit   *object.Commit
 	Branches []string
 	Hits     []Hit
+	Err      error
 }
 
+// ----- Main -----
 func main() {
-	defer os.RemoveAll(cloneDir)
-	_ = os.RemoveAll(cloneDir)
+	// Handle Ctrl+C / SIGTERM to allow graceful stop (state is saved after each commit).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	repo, err := git.PlainClone(cloneDir, false, &git.CloneOptions{URL: repoURL})
-	if err != nil {
-		log.Fatalf("clone: %v", err)
-	}
+	// Open or clone repo (keep folder for resume)
+	repo := openOrCloneRepo(cloneDir, repoURL)
 
-	// Fetch all branches/tags
+	// Fetch latest refs
 	if err := repo.Fetch(&git.FetchOptions{
 		RemoteName: "origin",
 		RefSpecs:   []config.RefSpec{"refs/*:refs/*"},
@@ -57,59 +79,114 @@ func main() {
 		log.Fatalf("fetch: %v", err)
 	}
 
-	// Collect unique commits + map of commit hash -> branch names
+	// Collect unique commits + commit->[]branches
 	commits, branchMap := collectAllCommits(repo)
 
-	// Sort by author date (descending)
 	sort.Slice(commits, func(i, j int) bool {
-		return commits[i].Author.When.After(commits[j].Author.When)
+		ti, tj := commits[i].Author.When, commits[j].Author.When
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return commits[i].Hash.String() > commits[j].Hash.String()
 	})
-	fmt.Printf("Collected %d unique commits across %d branch heads\n", len(commits), len(branchMap))
+
+
+	st := loadState(statePath)
+	if st.Processed == nil {
+		st.Processed = make(map[string]bool)
+	}
+
+	// Filter out processed commits
+	toScan := make([]*object.Commit, 0, len(commits))
+	skipped := 0
+	for _, c := range commits {
+		if st.Processed[c.Hash.String()] {
+			skipped++
+			continue
+		}
+		toScan = append(toScan, c)
+	}
+
+	fmt.Printf("Total commits: %d | already processed: %d | to scan now: %d\n",
+		len(commits), skipped, len(toScan))
 
 	
 	reAKIA := regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	reASIA := regexp.MustCompile(`ASIA[0-9A-Z]{16}`)
 	reSecret40 := regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9/+=])([A-Za-z0-9/+=]{40})(?:[^A-Za-z0-9/+=]|$)`)
-
 	matchers := []*regexp.Regexp{reAKIA, reASIA, reSecret40}
 
-	// Channels
-	jobs := make(chan Job, 50)
-	results := make(chan Result, 50)
+	
+	jobs := make(chan Job, 64)
+	results := make(chan Result, 64)
 
-	// Start workers
 	numWorkers := runtime.NumCPU()
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		go worker(repo, jobs, results, matchers, branchMap, &wg)
+		go worker(jobs, results, matchers, &wg)
 	}
 
-	// Printer goroutine
-	var pwg sync.WaitGroup
-	pwg.Add(1)
+	var collWG sync.WaitGroup
+	collWG.Add(1)
 	go func() {
-		defer pwg.Done()
+		defer collWG.Done()
 		for res := range results {
+			markProcessedAndSave(statePath, st, res.Commit.Hash.String())
+
+			if res.Err != nil {
+				log.Printf("scan error for %s: %v", res.Commit.Hash, res.Err)
+				continue
+			}
+			if len(res.Hits) == 0 {
+				continue
+			}
 			printResult(res)
 		}
 	}()
 
-	// Feed jobs sequentially
-	for _, c := range commits {
-		jobs <- Job{Commit: c}
-	}
-	close(jobs)
+	// enqueue jobs
+  for i, c := range toScan {
+      if ctx.Err() != nil { // stop cleanly on Ctrl+C / SIGTERM
+          fmt.Println("Signal received, stopping enqueue…")
+          break
+      }
+      chunks := extractChangedLinesForCommit(c)
+      jobs <- Job{
+          Index:    i,
+          Commit:   c,
+          Branches: branchMap[c.Hash.String()],
+          Chunks:   chunks,
+      }
+  }
+  close(jobs)
 
-	// Wait for workers, then close results
 	wg.Wait()
 	close(results)
-	pwg.Wait()
+	collWG.Wait()
 
-	fmt.Println("Done.")
+	fmt.Println("Scan finished.")
 }
 
-// collectAllCommits returns commits + map of commit hash -> branch names that reach it
+func openOrCloneRepo(dir, url string) *git.Repository {
+	// If folder exists & looks like a repo, open it; else clone.
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		repo, err := git.PlainOpen(dir)
+		if err != nil {
+			log.Fatalf("open repo: %v", err)
+		}
+		return repo
+	}
+	_ = os.MkdirAll(dir, 0755)
+	repo, err := git.PlainClone(dir, false, &git.CloneOptions{
+		URL: url,
+	})
+	if err != nil {
+		log.Fatalf("clone failed: %v", err)
+	}
+	return repo
+}
+
 func collectAllCommits(repo *git.Repository) ([]*object.Commit, map[string][]string) {
 	refs, err := repo.References()
 	if err != nil {
@@ -120,7 +197,7 @@ func collectAllCommits(repo *git.Repository) ([]*object.Commit, map[string][]str
 	branchMap := make(map[string][]string)
 
 	err = refs.ForEach(func(ref *plumbing.Reference) error {
-		// only remote branches; skip symbolic origin/HEAD
+		// Only remote branches; skip the symbolic origin/HEAD
 		if !ref.Name().IsRemote() || ref.Name().String() == "refs/remotes/origin/HEAD" {
 			return nil
 		}
@@ -157,85 +234,90 @@ func appendUnique(list []string, item string) []string {
 	return append(list, item)
 }
 
-// Worker: gets a commit, diffs vs parent, scans chunks for matches (adds + deletes)
-func worker(repo *git.Repository, jobs <-chan Job, results chan<- Result, matchers []*regexp.Regexp, branchMap map[string][]string, wg *sync.WaitGroup) {
+func extractChangedLinesForCommit(c *object.Commit) []ChunkLines {
+	var parentTree *object.Tree
+	if c.NumParents() > 0 {
+		if p, err := c.Parent(0); err == nil {
+			parentTree, _ = p.Tree()
+		}
+	}
+	thisTree, err := c.Tree()
+	if err != nil {
+		return nil
+	}
+
+	var patch *object.Patch
+	if parentTree == nil {
+		patch, err = thisTree.Patch(nil)
+	} else {
+		patch, err = parentTree.Patch(thisTree)
+	}
+	if err != nil || patch == nil {
+		return nil
+	}
+
+	var out []ChunkLines
+	for _, fp := range patch.FilePatches() {
+		from, to := fp.Files()
+		path := "(unknown)"
+		if to != nil {
+			path = to.Path()
+		} else if from != nil {
+			path = from.Path()
+		}
+
+		for _, ch := range fp.Chunks() {
+			switch ch.Type() {
+			case diff.Add:
+				lines := strings.Split(ch.Content(), "\n")
+				out = append(out, ChunkLines{File: path, Change: "added", Lines: lines})
+			case diff.Delete:
+				if scanDeletionsToo {
+					lines := strings.Split(ch.Content(), "\n")
+					out = append(out, ChunkLines{File: path, Change: "deleted", Lines: lines})
+				}
+			default:
+				// diff.Equal (context) — ignore
+			}
+		}
+	}
+	return out
+}
+
+func worker(jobs <-chan Job, results chan<- Result, matchers []*regexp.Regexp, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for job := range jobs {
-		c := job.Commit
-
-		// Diff commit vs parent (first parent for merges)
-		var parentTree *object.Tree
-		if c.NumParents() > 0 {
-			if p, err := c.Parent(0); err == nil {
-				parentTree, _ = p.Tree()
-			}
-		}
-		thisTree, err := c.Tree()
-		if err != nil {
-			continue
-		}
-
-		var patch *object.Patch
-		if parentTree == nil {
-			patch, err = thisTree.Patch(nil)
-		} else {
-			patch, err = parentTree.Patch(thisTree)
-		}
-		if err != nil {
-			continue
-		}
-
 		var hits []Hit
-		for _, fp := range patch.FilePatches() {
-			from, to := fp.Files()
-			path := "(unknown)"
-			if to != nil {
-				path = to.Path() // prefer new path (handles renames)
-			} else if from != nil {
-				path = from.Path()
-			}
 
-			for _, ch := range fp.Chunks() {
-				var change string
-				switch ch.Type() {
-				case diff.Add:
-					change = "added"
-				case diff.Delete:
-					change = "deleted"
-				default:
-					continue // skip equal/context
+		for _, chunk := range job.Chunks {
+			for _, ln := range chunk.Lines {
+				if len(ln) < 10 {
+					continue
 				}
-
-				lines := strings.Split(ch.Content(), "\n")
-				for _, ln := range lines {
-					if len(ln) < 10 {
-						continue
-					}
-					for _, re := range matchers {
-						if re.MatchString(ln) {
-							pat := re.String()
-							if re == matchers[2] { // the 40-char secret rule
-								pat = "AWS secret (40 chars)"
-							}
-							hits = append(hits, Hit{
-								File:    path,
-								Pattern: pat,
-								Line:    strings.TrimSpace(ln),
-								Change:  change,
-							})
-							break
+				for _, re := range matchers {
+					if re.MatchString(ln) {
+						pat := re.String()
+						if re == matchers[2] {
+							pat = "AWS secret (40 chars)"
 						}
+						hits = append(hits, Hit{
+							File:    chunk.File,
+							Pattern: pat,
+							Line:    strings.TrimSpace(ln),
+							Change:  chunk.Change,
+						})
+						break
 					}
 				}
 			}
 		}
 
-		if len(hits) > 0 {
-			results <- Result{
-				Commit:   c,
-				Branches: branchMap[c.Hash.String()],
-				Hits:     hits,
-			}
+		results <- Result{
+			Index:    job.Index,
+			Commit:   job.Commit,
+			Branches: job.Branches,
+			Hits:     hits,
+			Err:      nil,
 		}
 	}
 }
@@ -255,12 +337,12 @@ func printResult(res Result) {
 		if len(preview) > 200 {
 			preview = preview[:200] + "…"
 		}
-		// Prefix with +/- style hint based on change kind
 		prefix := "+"
 		if h.Change == "deleted" {
 			prefix = "-"
 		}
-		fmt.Printf("  %s  (%s) [matched %s]\n    %s %s\n", h.File, h.Change, h.Pattern, prefix, preview)
+		fmt.Printf("  %s  (%s) [matched %s]\n    %s %s\n",
+			h.File, h.Change, h.Pattern, prefix, preview)
 	}
 }
 
@@ -269,4 +351,66 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+func loadState(path string) *State {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return &State{Processed: make(map[string]bool)}
+	}
+	var st State
+	if err := json.Unmarshal(data, &st); err != nil || st.Processed == nil {
+		return &State{Processed: make(map[string]bool)}
+	}
+	return &st
+}
+
+var stateMu sync.Mutex
+
+func markProcessedAndSave(path string, st *State, hash string) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	if st.Processed == nil {
+		st.Processed = make(map[string]bool)
+	}
+	if st.Processed[hash] {
+		return // already recorded
+	}
+	st.Processed[hash] = true
+
+	tmp := path + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		log.Printf("state mkdir: %v", err)
+		return
+	}
+	f, err := os.Create(tmp)
+	if err != nil {
+		log.Printf("state create: %v", err)
+		return
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(st); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		log.Printf("state encode: %v", err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		log.Printf("state fsync: %v", err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("state close: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("state rename: %v", err)
+		return
+	}
 }
