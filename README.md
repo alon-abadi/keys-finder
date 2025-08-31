@@ -36,3 +36,16 @@ If you run it again, it will only process commits set to false.
 
 If you want to start over, delete this folder and run the script again. 
 
+
+## Docker: 
+You can also run a containarized version with docker. 
+Make sure to run docker, and build: 
+```
+docker build -t aws-secret-scanner .
+
+mkdir -p scan-data
+
+docker run --rm -it -v "$(pwd)/scan-data:/data" aws-secret-scanner
+```
+
+(saved state will be inside /scan-data/<repo>/.scan_state.json)
